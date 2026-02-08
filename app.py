@@ -1,5 +1,6 @@
 import math
 import re
+import xml.etree.ElementTree as ET
 
 import requests
 from requests.exceptions import ReadTimeout, RequestException
@@ -84,7 +85,7 @@ def oblicz_powierzchnie_m2(punkty):
     return abs(area) / 2.0
 
 
-# --- 2. MPZP: PRÓBA WFS (mpzp.igeomap.pl) ---
+# --- 2. MPZP: PRÓBA WFS (mpzp.igeomap.pl) z parsowaniem GML ---
 
 def pobierz_mpzp_z_wfs(punkty):
     """
@@ -94,10 +95,9 @@ def pobierz_mpzp_z_wfs(punkty):
     2. Przelicza go do EPSG:2180 (metry).
     3. Robi mały BBOX wokół punktu.
     4. Odczytuje WFS GetCapabilities, żeby znaleźć typeName.
-    5. Robi GetFeature z BBOX i buduje prosty HTML z atrybutami pierwszego obiektu.
+    5. Robi GetFeature z BBOX (GML) i buduje prosty HTML z atrybutami pierwszego obiektu.
 
-    Jeśli się nie uda – rzuca wyjątek, który łapiemy wyżej
-    i możemy wtedy albo pokazać komunikat, albo spróbować czegoś innego.
+    Jeśli nic nie znajdzie albo coś pójdzie nie tak – rzuca RuntimeError.
     """
     if not punkty:
         raise ValueError("Brak punktów do zapytania WFS MPZP.")
@@ -131,27 +131,25 @@ def pobierz_mpzp_z_wfs(punkty):
     except Exception as e:
         raise RuntimeError(f"Błąd GetCapabilities WFS MPZP: {e}")
 
-    import xml.etree.ElementTree as ET
-
     try:
-        root = ET.fromstring(cap_resp.content)
+        root_cap = ET.fromstring(cap_resp.content)
     except ET.ParseError as e:
         raise RuntimeError(f"Nie można sparsować GetCapabilities WFS MPZP: {e}")
 
-    ns = {
+    ns_cap = {
         "wfs": "http://www.opengis.net/wfs",
         "ows": "http://www.opengis.net/ows",
         "xsd": "http://www.w3.org/2001/XMLSchema",
     }
 
-    type_names = [el.text for el in root.findall(".//wfs:FeatureType/wfs:Name", ns)]
+    type_names = [el.text for el in root_cap.findall(".//wfs:FeatureType/wfs:Name", ns_cap)]
     if not type_names:
         raise RuntimeError("Brak FeatureType w WFS MPZP (GetCapabilities).")
 
-    # Na start bierzemy pierwszy typ z listy
+    # Na start bierzemy pierwszy typ z listy (jeśli trzeba, można to później uszczegółowić)
     type_name = type_names[0]
 
-    # 5. GetFeature z BBOX w EPSG:2180
+    # 5. GetFeature z BBOX w EPSG:2180 – domyślnie GML (OUTPUTFORMAT nie wymuszamy)
     getfeat_params = {
         "SERVICE": "WFS",
         "VERSION": "1.1.0",
@@ -159,8 +157,6 @@ def pobierz_mpzp_z_wfs(punkty):
         "TYPENAME": type_name,
         "SRSNAME": "EPSG:2180",
         "BBOX": f"{minx},{miny},{maxx},{maxy},EPSG:2180",
-        # próbujemy JSON – jeśli serwer nie obsługuje, dostaniemy błąd i poleci wyjątek
-        "OUTPUTFORMAT": "application/json",
         "MAXFEATURES": "10",
     }
 
@@ -172,22 +168,44 @@ def pobierz_mpzp_z_wfs(punkty):
     except RequestException as e:
         raise RuntimeError(f"Błąd GetFeature WFS MPZP: {e}")
 
-    # Parsowanie JSON – zakładamy, że serwer przyjął outputFormat=application/json
+    # Parsowanie GML
     try:
-        data = feat_resp.json()
-    except ValueError:
-        # Nie JSON – serwer zwrócił np. GML; można dalej rozbudować, ale na razie uznajemy za błąd
-        raise RuntimeError("WFS MPZP nie zwrócił JSON (OUTPUTFORMAT=application/json).")
+        root_feat = ET.fromstring(feat_resp.content)
+    except ET.ParseError as e:
+        raise RuntimeError(f"Nie można sparsować GML z WFS MPZP: {e}")
 
-    features = data.get("features", [])
-    if not features:
-        raise RuntimeError("WFS MPZP nie zwrócił obiektów dla wskazanego obszaru.")
+    ns_gml = {"gml": "http://www.opengis.net/gml"}
 
-    # Bierzemy pierwszy obiekt i wypisujemy jego atrybuty
-    props = features[0].get("properties", {})
+    # Szukamy pierwszego featureMember
+    fm = root_feat.find(".//gml:featureMember", ns_gml)
+    if fm is None:
+        raise RuntimeError("WFS MPZP nie zwrócił featureMember dla wskazanego obszaru.")
+
+    # Pierwszy element potomny featureMember to zwykle sam obiekt (feature)
+    feature = None
+    for child in fm:
+        if isinstance(child.tag, str):
+            feature = child
+            break
+
+    if feature is None:
+        raise RuntimeError("WFS MPZP: featureMember nie zawiera obiektu feature.")
+
+    # Zbieramy atrybuty (pomijając geometrię)
+    props = {}
+    for child in feature:
+        if not isinstance(child.tag, str):
+            continue
+        local_name = child.tag.split("}")[-1]
+        # prosta heurystyka: pomijamy pola geometryczne
+        if local_name.lower() in ("geom", "geometry", "the_geom", "msgeometry"):
+            continue
+        text = (child.text or "").strip()
+        if text:
+            props[local_name] = text
 
     if not props:
-        raise RuntimeError("WFS MPZP zwrócił obiekt bez atrybutów.")
+        raise RuntimeError("WFS MPZP zwrócił obiekt bez atrybutów (lub tylko geometrię).")
 
     # Budujemy prosty HTML z tabelką atrybutów
     rows = []
@@ -324,7 +342,7 @@ with col_map:
             attr="GUGiK",
         ).add_to(m)
 
-        # MPZP – możesz zostawić krajowy KIMPZP jako podgląd graficzny
+        # MPZP – nadal możesz zostawić krajowy KIMPZP jako podgląd graficzny
         folium.raster_layers.WmsTileLayer(
             url=(
                 "https://mapy.geoportal.gov.pl/wss/ext/"
