@@ -17,15 +17,14 @@ st.markdown(
     "Domyślnie przyjmujemy kolejność **Lat, Lon** (szerokość, długość)."
 )
 
-# --- INICJALIZACJA PAMIĘCI SESJI ---
-if "punkty_mapy" not in st.session_state:
-    st.session_state.punkty_mapy = None
+# --- KONFIG MPZP (Wieliczka / mpzp.igeomap.pl) ---
 
-if "wyniki_powierzchni" not in st.session_state:
-    st.session_state.wyniki_powierzchni = None
+# Adres usługi MPZP dla gminy Wieliczka (Geo-System / IGEOMAP)
+MPZP_WFS_URL = "https://mpzp.igeomap.pl/cgi-bin/121905"
 
-if "mpzp_html" not in st.session_state:
-    st.session_state.mpzp_html = None
+# Transformer WGS84 -> PUWG 1992 (EPSG:4326 -> EPSG:2180), potrzebny do BBOX w metrach
+# always_xy=True: wejście jako (lon, lat)
+transformer_4326_2180 = Transformer.from_crs("EPSG:4326", "EPSG:2180", always_xy=True)
 
 
 # --- 1. FUNKCJE POMOCNICZE ---
@@ -85,85 +84,140 @@ def oblicz_powierzchnie_m2(punkty):
     return abs(area) / 2.0
 
 
-# --- 2. MPZP: FUNKCJA POBIERANIA INFORMACJI Z KIMPZP (EPSG:2180) ---
+# --- 2. MPZP: PRÓBA WFS (mpzp.igeomap.pl) ---
 
-# Transformer WGS84 -> PUWG 1992 (EPSG:4326 -> EPSG:2180)
-# always_xy=True: wejście jako (lon, lat)
-transformer_4326_2180 = Transformer.from_crs("EPSG:4326", "EPSG:2180", always_xy=True)
-
-
-def pobierz_mpzp_html(punkty):
+def pobierz_mpzp_z_wfs(punkty):
     """
-    punkty – lista [lat, lon] w WGS84 (EPSG:4326).
-    Zwraca HTML z odpowiedzi GetFeatureInfo z usługi
-    Krajowa Integracja Miejscowych Planów Zagospodarowania Przestrzennego (KIMPZP).
+    Próbuje pobrać dane MPZP z usługi WFS (mpzp.igeomap.pl) dla gminy Wieliczka.
 
-    Używamy SRS=EPSG:2180, tak jak w oficjalnym przykładzie usługi.
-    Jeśli usługa nie odpowie / zwróci błąd, zwracamy tekstowy komunikat w HTML.
+    1. Wyznacza środek wielokąta w EPSG:4326.
+    2. Przelicza go do EPSG:2180 (metry).
+    3. Robi mały BBOX wokół punktu.
+    4. Odczytuje WFS GetCapabilities, żeby znaleźć typeName.
+    5. Robi GetFeature z BBOX i buduje prosty HTML z atrybutami pierwszego obiektu.
+
+    Jeśli się nie uda – rzuca wyjątek, który łapiemy wyżej
+    i możemy wtedy albo pokazać komunikat, albo spróbować czegoś innego.
     """
     if not punkty:
-        return "<p>Brak punktów do zapytania MPZP.</p>"
+        raise ValueError("Brak punktów do zapytania WFS MPZP.")
 
-    # środek wielokąta w WGS84
+    # 1. środek wielokąta w WGS84
     lats = [p[0] for p in punkty]
     lons = [p[1] for p in punkty]
     center_lat = sum(lats) / len(lats)
     center_lon = sum(lons) / len(lons)
 
-    # transformacja do EPSG:2180 (x, y w metrach)
+    # 2. transformacja do EPSG:2180 (x, y w metrach)
     x_2180, y_2180 = transformer_4326_2180.transform(center_lon, center_lat)
 
-    # małe okno w metrach (np. 10 m w każdą stronę)
+    # 3. małe okno w metrach (np. 10 m w każdą stronę)
     delta_m = 10.0
     minx = x_2180 - delta_m
     maxx = x_2180 + delta_m
     miny = y_2180 - delta_m
     maxy = y_2180 + delta_m
 
-    url = (
-        "https://mapy.geoportal.gov.pl/wss/ext/"
-        "KrajowaIntegracjaMiejscowychPlanowZagospodarowaniaPrzestrzennego"
-    )
-
-    params = {
-        "SERVICE": "WMS",
-        "REQUEST": "GetFeatureInfo",
-        "VERSION": "1.1.1",
-        "SRS": "EPSG:2180",
-        # warstwy standardowo używane w KIMPZP
-        "LAYERS": "granice,raster,wektor-str,wektor-lzb,wektor-lin,wektor-pow,wektor-pkt",
-        "QUERY_LAYERS": "granice,raster,wektor-str,wektor-lzb,wektor-lin,wektor-pow,wektor-pkt",
-        "BBOX": f"{minx},{miny},{maxx},{maxy}",
-        "WIDTH": 101,
-        "HEIGHT": 101,
-        "X": 50,  # środek "rastra"
-        "Y": 50,
-        "FORMAT": "image/png",
-        "INFO_FORMAT": "text/html",  # dostajemy gotowy HTML do wyświetlenia
-        "TRANSPARENT": "TRUE",
+    # 4. WFS GetCapabilities – bierzemy pierwszy FeatureType jako domyślny
+    cap_params = {
+        "SERVICE": "WFS",
+        "REQUEST": "GetCapabilities",
+        "VERSION": "1.1.0",
     }
 
     try:
-        # dłuższy timeout, bo Geoportal bywa ociężały
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
+        cap_resp = requests.get(MPZP_WFS_URL, params=cap_params, timeout=15)
+        cap_resp.raise_for_status()
+    except Exception as e:
+        raise RuntimeError(f"Błąd GetCapabilities WFS MPZP: {e}")
+
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(cap_resp.content)
+    except ET.ParseError as e:
+        raise RuntimeError(f"Nie można sparsować GetCapabilities WFS MPZP: {e}")
+
+    ns = {
+        "wfs": "http://www.opengis.net/wfs",
+        "ows": "http://www.opengis.net/ows",
+        "xsd": "http://www.w3.org/2001/XMLSchema",
+    }
+
+    type_names = [el.text for el in root.findall(".//wfs:FeatureType/wfs:Name", ns)]
+    if not type_names:
+        raise RuntimeError("Brak FeatureType w WFS MPZP (GetCapabilities).")
+
+    # Na start bierzemy pierwszy typ z listy
+    type_name = type_names[0]
+
+    # 5. GetFeature z BBOX w EPSG:2180
+    getfeat_params = {
+        "SERVICE": "WFS",
+        "VERSION": "1.1.0",
+        "REQUEST": "GetFeature",
+        "TYPENAME": type_name,
+        "SRSNAME": "EPSG:2180",
+        "BBOX": f"{minx},{miny},{maxx},{maxy},EPSG:2180",
+        # próbujemy JSON – jeśli serwer nie obsługuje, dostaniemy błąd i poleci wyjątek
+        "OUTPUTFORMAT": "application/json",
+        "MAXFEATURES": "10",
+    }
+
+    try:
+        feat_resp = requests.get(MPZP_WFS_URL, params=getfeat_params, timeout=20)
+        feat_resp.raise_for_status()
     except ReadTimeout:
-        return (
-            "<p><b>MPZP:</b> serwer Geoportalu nie odpowiedział w wyznaczonym czasie "
-            "(limit 20 s). Spróbuj ponownie za chwilę lub sprawdź ręcznie w Geoportalu.</p>"
-        )
+        raise RuntimeError("Timeout przy GetFeature WFS MPZP (przekroczono limit 20 s).")
     except RequestException as e:
-        # inne błędy HTTP/połączenia
-        return f"<p><b>MPZP:</b> błąd zapytania do Geoportalu: {e}</p>"
+        raise RuntimeError(f"Błąd GetFeature WFS MPZP: {e}")
 
-    text = r.text.strip()
-    if not text:
-        return "<p>MPZP: brak informacji (pusta odpowiedź usługi).</p>"
+    # Parsowanie JSON – zakładamy, że serwer przyjął outputFormat=application/json
+    try:
+        data = feat_resp.json()
+    except ValueError:
+        # Nie JSON – serwer zwrócił np. GML; można dalej rozbudować, ale na razie uznajemy za błąd
+        raise RuntimeError("WFS MPZP nie zwrócił JSON (OUTPUTFORMAT=application/json).")
 
-    return text
+    features = data.get("features", [])
+    if not features:
+        raise RuntimeError("WFS MPZP nie zwrócił obiektów dla wskazanego obszaru.")
+
+    # Bierzemy pierwszy obiekt i wypisujemy jego atrybuty
+    props = features[0].get("properties", {})
+
+    if not props:
+        raise RuntimeError("WFS MPZP zwrócił obiekt bez atrybutów.")
+
+    # Budujemy prosty HTML z tabelką atrybutów
+    rows = []
+    for k, v in props.items():
+        rows.append(f"<tr><td><b>{k}</b></td><td>{v}</td></tr>")
+
+    html = (
+        "<p><b>MPZP (WFS, mpzp.igeomap.pl – Wieliczka)</b></p>"
+        "<table border='1' cellpadding='4' cellspacing='0'>"
+        "<tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+    return html
 
 
-# --- 3. INTERFEJS UŻYTKOWNIKA ---
+# --- 3. SESSION STATE ---
+
+if "punkty_mapy" not in st.session_state:
+    st.session_state.punkty_mapy = None
+
+if "wyniki_powierzchni" not in st.session_state:
+    st.session_state.wyniki_powierzchni = None
+
+if "mpzp_html" not in st.session_state:
+    st.session_state.mpzp_html = None
+
+
+# --- 4. INTERFEJS UŻYTKOWNIKA ---
 
 col_input, col_map = st.columns([1, 2])
 
@@ -209,20 +263,21 @@ with col_input:
                     "ha": pole_m2 / 10000.0,
                 }
 
-                # MPZP – zabezpieczone try/except, żeby w razie błędu nie rozwalić działania apki
+                # MPZP – próbujemy WFS; jeśli się nie uda, pokażemy komunikat
                 try:
-                    st.session_state.mpzp_html = pobierz_mpzp_html(
+                    st.session_state.mpzp_html = pobierz_mpzp_z_wfs(
                         przetworzone_punkty
                     )
                 except Exception as e:
                     st.session_state.mpzp_html = (
-                        f"<p><b>MPZP:</b> błąd zapytania MPZP: {e}</p>"
+                        "<p><b>MPZP (WFS):</b> nie udało się pobrać danych z serwera "
+                        f"mpzp.igeomap.pl dla tej lokalizacji. Szczegóły: {e}</p>"
                     )
         else:
             st.warning("Wklej najpierw dane!")
 
 
-# --- 4. WYŚWIETLANIE WYNIKÓW (MAPA + MPZP) ---
+# --- 5. WYŚWIETLANIE WYNIKÓW (MAPA + MPZP) ---
 
 with col_map:
     if st.session_state.punkty_mapy is not None:
@@ -236,13 +291,13 @@ with col_map:
         m3.metric("Hektary", f"{wyniki['ha']:.4f} ha")
 
         # MPZP – informacja tekstowa
-        st.subheader("Informacja o MPZP (Geoportal)")
+        st.subheader("Informacja o MPZP (WFS – mpzp.igeomap.pl / Wieliczka)")
         if st.session_state.mpzp_html:
             st.markdown(st.session_state.mpzp_html, unsafe_allow_html=True)
         else:
             st.info(
-                "Brak informacji z usługi MPZP lub odpowiedź była pusta "
-                "(działka prawdopodobnie bez obowiązującego MPZP lub błąd po stronie serwera)."
+                "Brak informacji z WFS MPZP lub odpowiedź była pusta. "
+                "Możliwe, że dla tej działki brak wektorowego planu lub serwer nie zwrócił obiektu."
             )
 
         # mapa Folium
@@ -269,14 +324,14 @@ with col_map:
             attr="GUGiK",
         ).add_to(m)
 
-        # MPZP – overlay z KIMPZP
+        # MPZP – możesz zostawić krajowy KIMPZP jako podgląd graficzny
         folium.raster_layers.WmsTileLayer(
             url=(
                 "https://mapy.geoportal.gov.pl/wss/ext/"
                 "KrajowaIntegracjaMiejscowychPlanowZagospodarowaniaPrzestrzennego"
             ),
             layers="granice,raster,wektor-str,wektor-lzb,wektor-lin,wektor-pow,wektor-pkt",
-            name="MPZP",
+            name="MPZP (krajowy)",
             fmt="image/png",
             transparent=True,
             attr="GUGiK / Krajowa Integracja MPZP",
