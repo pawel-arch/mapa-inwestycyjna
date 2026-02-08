@@ -3,6 +3,7 @@ import folium
 from streamlit_folium import st_folium
 import math
 import re
+import requests  # <-- NOWE: do zapytań HTTP (MPZP)
 
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="Kalkulator Działek", layout="wide")
@@ -16,6 +17,8 @@ if 'punkty_mapy' not in st.session_state:
     st.session_state.punkty_mapy = None
 if 'wyniki_powierzchni' not in st.session_state:
     st.session_state.wyniki_powierzchni = None
+if 'mpzp_html' not in st.session_state:
+    st.session_state.mpzp_html = None  # <-- MPZP: przechowujemy ostatnią odpowiedź
 
 # --- 1. FUNKCJE POMOCNICZE ---
 def parsuj_wspolrzedne(tekst):
@@ -34,7 +37,8 @@ def parsuj_wspolrzedne(tekst):
     return punkty
 
 def oblicz_powierzchnie_m2(punkty):
-    if not punkty: return 0
+    if not punkty:
+        return 0
     # Oblicz środek geometryczny
     center_lat = sum(p[0] for p in punkty) / len(punkty)
     center_lon = sum(p[1] for p in punkty) / len(punkty)
@@ -59,6 +63,66 @@ def oblicz_powierzchnie_m2(punkty):
         area += x1 * y2 - x2 * y1
     return abs(area) / 2.0
 
+# --- MPZP: FUNKCJA POBIERANIA INFORMACJI Z KIMPZP ---
+
+def pobierz_mpzp_html(punkty):
+    """
+    punkty – lista [lat, lon] w WGS84 (EPSG:4326)
+    Zwraca HTML z odpowiedzi GetFeatureInfo z usługi
+    KrajowaIntegracjaMiejscowychPlanowZagospodarowaniaPrzestrzennego.
+    """
+    if not punkty:
+        return None
+
+    # Środek wielokąta z Twoich punktów (w stopniach)
+    lats = [p[0] for p in punkty]
+    lons = [p[1] for p in punkty]
+    center_lat = sum(lats) / len(lats)
+    center_lon = sum(lons) / len(lons)
+
+    # Małe okno w stopniach (~10 m w każdą stronę)
+    # 1 stopień ≈ 111 km, więc 10 m ≈ 0.00009°
+    delta_deg = 0.0001
+    min_lon = center_lon - delta_deg
+    max_lon = center_lon + delta_deg
+    min_lat = center_lat - delta_deg
+    max_lat = center_lat + delta_deg
+
+    # Parametry WMS GetFeatureInfo (wersja 1.1.1 -> SRS + BBOX jako lon/lat)
+    url = "https://mapy.geoportal.gov.pl/wss/ext/KrajowaIntegracjaMiejscowychPlanowZagospodarowaniaPrzestrzennego"
+
+    params = {
+        "SERVICE": "WMS",
+        "REQUEST": "GetFeatureInfo",
+        "VERSION": "1.1.1",
+        "SRS": "EPSG:4326",
+        # typowe warstwy z przykładowego zapytania Geoportalu
+        "LAYERS": "granice,raster,wektor-str,wektor-lzb,wektor-lin,wektor-pow,wektor-pkt",
+        "QUERY_LAYERS": "granice,raster,wektor-str,wektor-lzb,wektor-lin,wektor-pow,wektor-pkt",
+        "BBOX": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+        "WIDTH": 101,
+        "HEIGHT": 101,
+        "X": 50,   # środek rastra
+        "Y": 50,
+        "FORMAT": "image/png",
+        "INFO_FORMAT": "text/html",  # dostaniemy HTML gotowy do pokazania
+        "TRANSPARENT": "TRUE",
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        r.raise_for_status()
+    except Exception as e:
+        return f"<p><b>Błąd pobierania informacji z MPZP:</b> {e}</p>"
+
+    text = r.text.strip()
+    if not text:
+        return "<p>Brak informacji o MPZP (pusta odpowiedź usługi).</p>"
+
+    # Czasami serwer może zwrócić lakoniczny komunikat; nie filtrujemy go na siłę,
+    # bo zależy od konkretnej jednostki. Wyświetlamy „jak jest”.
+    return text
+
 # --- 2. INTERFEJS UŻYTKOWNIKA ---
 
 col_input, col_map = st.columns([1, 2])
@@ -78,7 +142,6 @@ with col_input:
         if dan_wejsciowe:
             przetworzone_punkty = parsuj_wspolrzedne(dan_wejsciowe)
 
-            # Tutaj był Twój błąd - teraz linia jest kompletna:
             if zamien_kolejnosc:
                 przetworzone_punkty = [[p[1], p[0]] for p in przetworzone_punkty]
 
@@ -88,13 +151,16 @@ with col_input:
                 # ZAPIS DO PAMIĘCI SESJI
                 st.session_state.punkty_mapy = przetworzone_punkty
 
-                # OBLICZENIA
+                # OBLICZENIA POWIERZCHNI
                 m2 = oblicz_powierzchnie_m2(przetworzone_punkty)
                 st.session_state.wyniki_powierzchni = {
                     'm2': m2,
                     'ar': m2 / 100.0,
                     'ha': m2 / 10000.0
                 }
+
+                # MPZP: pobieramy dane dla nowej działki i też zapisujemy w sesji
+                st.session_state.mpzp_html = pobierz_mpzp_html(przetworzone_punkty)
         else:
             st.warning("Wklej najpierw dane!")
 
@@ -106,38 +172,6 @@ with col_map:
         wyniki = st.session_state.wyniki_powierzchni
 
         # Wyświetlenie wyników liczbowych
-        m1, m2, m3 = st.columns(3)
+        m1, m2c, m3 = st.columns(3)
         m1.metric("Metry kwadratowe", f"{wyniki['m2']:,.0f} m²")
-        m2.metric("Ary", f"{wyniki['ar']:.2f} ar")
-        m3.metric("Hektary", f"{wyniki['ha']:.4f} ha")
-
-        # Generowanie mapy Folium
-        srodek = punkty[0]
-        m = folium.Map(location=srodek, zoom_start=18)
-
-        # Warstwa Ortofotomapy
-        folium.raster_layers.WmsTileLayer(
-            url='https://mapy.geoportal.gov.pl/wss/service/PZGIK/ORTO/WMS/StandardResolution',
-            layers='Raster', name='Ortofotomapa', fmt='image/png', transparent=True, attr='GUGiK'
-        ).add_to(m)
-
-        # Warstwa Działek
-        folium.raster_layers.WmsTileLayer(
-            url='https://integracja.gugik.gov.pl/cgi-bin/KrajowaIntegracjaEwidencjiGruntow',
-            layers='dzialki', name='Działki', fmt='image/png', transparent=True, attr='GUGiK'
-        ).add_to(m)
-
-        # Rysowanie obszaru
-        folium.Polygon(
-            locations=punkty,
-            color="red", weight=3, fill=True, fill_color="blue", fill_opacity=0.3,
-            popup=f"Powierzchnia: {wyniki['m2']:,.0f} m²"
-        ).add_to(m)
-
-        # Wyrenderowanie mapy
-        st_folium(m, width=800, height=600)
-
-        # Przycisk czyszczenia
-        if st.button("Wyczyść mapę"):
-            st.session_state.punkty_mapy = None
-            st.rerun()
+        m2c.metric("Ary", f"{wyniki['ar']:.2f} ar")
