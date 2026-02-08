@@ -9,74 +9,54 @@ import folium
 from streamlit_folium import st_folium
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="Mapa inwestycyjna + MPZP", layout="wide")
+st.set_page_config(page_title="Mapa Inwestycyjna (Uniwersalna)", layout="wide")
 
-st.title("🗺️ Mapa Inwestycyjna + Kalkulator")
+st.title("🗺️ Mapa Inwestycyjna + MPZP (Polska)")
 st.markdown(
-    "Wklej współrzędne w dowolnym formacie (z nawiasami, bez, z przecinkami lub spacjami). "
-    "Domyślnie przyjmujemy kolejność **Lat, Lon** (szerokość, długość)."
+    "Uniwersalne narzędzie do sprawdzania MPZP w całej Polsce (przez Integrację Krajową GUGiK). "
+    "Wklej współrzędne, aby sprawdzić, czy gmina udostępnia dane wektorowe."
 )
 
-# --- KONFIGURACJA MPZP (NAPRAWIONA) ---
-
-# Używamy Integratora Krajowego GUGiK.
-# To usługa, która "wie", gdzie szukać planów dla każdej gminy w Polsce
-# i obsługuje standardowe nazwy warstw (app.Rysunki...).
-MPZP_WFS_URL = "https://mapy.geoportal.gov.pl/wss/ext/KrajowaIntegracjaMiejscowychPlanowZagospodarowaniaPrzestrzennego"
-
-# Nazwy warstw specyficzne dla standardu krajowego
-MPZP_WFS_TYPENAMES = "app.RysunkiAktuPlanowania.MPZP,app.DokumentFormalny.MPZP"
-
 # Transformer WGS84 -> Web Mercator (EPSG:4326 -> EPSG:3857)
-# Wiele usług MPZP WFS wymaga współrzędnych w metrach (3857)
 transformer_4326_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
 
-# --- 1. FUNKCJE POMOCNICZE ---
+# --- 1. FUNKCJE POMOCNICZE (WSPÓŁRZĘDNE I POWIERZCHNIA) ---
 
 def parsuj_wspolrzedne(tekst: str):
-    """
-    Wyciąga wszystkie liczby z tekstu i grupuje w pary [lat, lon].
-    """
+    """Parsuje tekst na listę punktów [lat, lon]."""
     liczby = re.findall(r"-?\d+\.?\d*", tekst)
     liczby_float = [float(x) for x in liczby]
 
-    # Jeśli liczba wartości jest nieparzysta, odetnij ostatnią
     if len(liczby_float) % 2 != 0:
         liczby_float = liczby_float[:-1]
 
     punkty = []
     for i in range(0, len(liczby_float), 2):
-        # Domyślnie zakładamy [Lat, Lon]
         punkty.append([liczby_float[i], liczby_float[i + 1]])
 
     return punkty
 
 
 def oblicz_powierzchnie_m2(punkty):
-    """
-    Liczy przybliżoną powierzchnię wielokąta (wzór Gaussa + rzutowanie).
-    """
+    """Liczy powierzchnię w m2 (wzór Gaussa)."""
     if not punkty:
         return 0.0
 
-    # Środek geometryczny
     center_lat = sum(p[0] for p in punkty) / len(punkty)
     center_lon = sum(p[1] for p in punkty) / len(punkty)
 
-    R = 6378137  # promień Ziemi
+    R = 6378137
     lat_rad = math.radians(center_lat)
     metry_na_stopien_lat = 111132.954
     metry_na_stopien_lon = (math.pi / 180) * R * math.cos(lat_rad)
 
-    # Rzutowanie na płaszczyznę
     xy = []
     for lat, lon in punkty:
         y = (lat - center_lat) * metry_na_stopien_lat
         x = (lon - center_lon) * metry_na_stopien_lon
         xy.append((x, y))
 
-    # Wzór Gaussa (shoelace formula)
     area = 0.0
     for i in range(len(xy)):
         x1, y1 = xy[i]
@@ -86,93 +66,118 @@ def oblicz_powierzchnie_m2(punkty):
     return abs(area) / 2.0
 
 
-# --- 2. MPZP: WFS (Integrator Krajowy) ---
+# --- 2. MPZP: UNIWERSALNY POBIERACZ (GUGiK + FALLBACK) ---
 
 def pobierz_mpzp_z_wfs(punkty):
     """
-    Pobiera dane MPZP z Krajowej Integracji GUGiK.
+    Pobiera dane MPZP.
+    Strategia:
+    1. Próba z Integratora Krajowego (GUGiK) - działa dla Przejazdowa i większości Polski.
+    2. Jeśli brak danych -> Próba z lokalnego serwera Wieliczki (fallback na życzenie).
     """
     if not punkty:
         raise ValueError("Brak punktów do zapytania WFS MPZP.")
 
-    # 1. Środek wielokąta w WGS84
+    # 1. Obliczenia geometryczne
     lats = [p[0] for p in punkty]
     lons = [p[1] for p in punkty]
     center_lat = sum(lats) / len(lats)
     center_lon = sum(lons) / len(lons)
 
-    # 2. Transformacja do EPSG:3857 (x, y w metrach)
-    # UWAGA: transformer.transform(lon, lat) bo always_xy=True
+    # Transformacja do EPSG:3857 (metry)
     x_3857, y_3857 = transformer_4326_3857.transform(center_lon, center_lat)
 
-    # 3. BBOX (okno wyszukiwania) - np. 20 metrów wokół środka
+    # BBOX (okno wyszukiwania) - 20 metrów wokół środka działki
     delta_m = 20.0
-    minx = x_3857 - delta_m
-    maxx = x_3857 + delta_m
-    miny = y_3857 - delta_m
-    maxy = y_3857 + delta_m
+    bbox_str = f"{x_3857 - delta_m},{y_3857 - delta_m},{x_3857 + delta_m},{y_3857 + delta_m},EPSG:3857"
 
-    # 4. Parametry zapytania WFS GetFeature
-    getfeat_params = {
-        "SERVICE": "WFS",
-        "VERSION": "1.1.0",
-        "REQUEST": "GetFeature",
-        "TYPENAME": MPZP_WFS_TYPENAMES,
-        "SRSNAME": "EPSG:3857",
-        "BBOX": f"{minx},{miny},{maxx},{maxy},EPSG:3857",
-        "MAXFEATURES": "5", # Wystarczy kilka obiektów
-    }
-
-    try:
-        # Zwiększony timeout do 30s, bo usługi krajowe bywają wolne
-        feat_resp = requests.get(MPZP_WFS_URL, params=getfeat_params, timeout=30)
-        feat_resp.raise_for_status()
-    except ReadTimeout:
-        raise RuntimeError("Serwer GUGiK nie odpowiedział w ciągu 30 sekund (Timeout).")
-    except RequestException as e:
-        raise RuntimeError(f"Błąd połączenia z WFS: {e}")
-
-    # Parsowanie XML (GML)
-    try:
-        root_feat = ET.fromstring(feat_resp.content)
-    except ET.ParseError as e:
-        # Czasami serwer zwraca błąd tekstowy zamiast XML
-        raise RuntimeError(f"Nie można odczytać odpowiedzi XML: {e}. Treść: {feat_resp.text[:100]}...")
-
-    # Namespaces (przestrzenie nazw) w GML
-    # GUGiK często używa 'gml' lub domyślnych
-    ns = {"gml": "http://www.opengis.net/gml"}
-
-    # Szukamy featureMember (dowolnego obiektu w odpowiedzi)
-    # W zależności od wersji GML może to być gml:featureMember lub featureMember
-    fm = root_feat.find(".//gml:featureMember", ns)
-    if fm is None:
-        fm = root_feat.find(".//featureMember") # próba bez namespace
+    # --- KONFIGURACJA ŹRÓDEŁ ---
     
-    if fm is None:
-        raise RuntimeError("Serwer zwrócił pusty wynik (brak obiektu 'featureMember'). Prawdopodobnie brak wektorowego planu w tym punkcie.")
+    # Źródło 1: GUGiK (Cała Polska)
+    url_gugik = "https://mapy.geoportal.gov.pl/wss/ext/KrajowaIntegracjaMiejscowychPlanowZagospodarowaniaPrzestrzennego"
+    layers_gugik = "app.RysunkiAktuPlanowania.MPZP,app.DokumentFormalny.MPZP"
+    
+    # Źródło 2: Wieliczka (Lokalny Geo-System - Fallback)
+    url_wieliczka = "https://mpzp.igeomap.pl/cgi-bin/121905"
+    layers_wieliczka = "mpzp"
 
-    # Wyciągamy pierwszy znaleziony obiekt
+    def wykonaj_zapytanie(url, layers, nazwa_zrodla):
+        """Pomocnicza funkcja wykonująca request do konkretnego WFS"""
+        params = {
+            "SERVICE": "WFS",
+            "VERSION": "1.1.0",
+            "REQUEST": "GetFeature",
+            "TYPENAME": layers,
+            "SRSNAME": "EPSG:3857",
+            "BBOX": bbox_str,
+            "MAXFEATURES": "5" # Pobieramy max 5 obiektów
+        }
+        try:
+            # Timeout 15s
+            resp = requests.get(url, params=params, timeout=15)
+            resp.raise_for_status()
+            
+            # Parsowanie XML
+            root = ET.fromstring(resp.content)
+            
+            # Szukanie featureMember (z namespace lub bez)
+            ns = {"gml": "http://www.opengis.net/gml"}
+            fm = root.find(".//gml:featureMember", ns)
+            if fm is None:
+                fm = root.find(".//featureMember")
+            
+            # Sprawdzenie czy w środku jest jakikolwiek obiekt
+            if fm is not None and list(fm):
+                return fm # Sukces - mamy dane
+            else:
+                return None # Pusty wynik (brak planu w tym miejscu)
+                
+        except Exception as e:
+            # Błędy połączenia ignorujemy w tej funkcji, by spróbować kolejnego źródła
+            # print(f"Błąd źródła {nazwa_zrodla}: {e}")
+            return None
+
+    # --- LOGIKA PRZEŁĄCZANIA ---
+    
+    # KROK 1: Próba GUGiK (Polska)
+    feature_member = wykonaj_zapytanie(url_gugik, layers_gugik, "GUGiK")
+    zrodlo_sukces = "Krajowa Integracja MPZP (GUGiK)"
+    
+    # KROK 2: Jeśli GUGiK pusty -> Próba Wieliczka (Lokalny)
+    if feature_member is None:
+        feature_member = wykonaj_zapytanie(url_wieliczka, layers_wieliczka, "Wieliczka")
+        zrodlo_sukces = "Lokalny Serwer (Geo-System)"
+
+    # Jeśli nadal nic:
+    if feature_member is None:
+        raise RuntimeError(
+            "Nie udało się pobrać danych wektorowych MPZP.<br>"
+            "Możliwe przyczyny:<br>"
+            "1. Gmina nie udostępnia planu w formacie wektorowym (tylko obrazek).<br>"
+            "2. Wskazany punkt leży poza obszarem objętym planem (np. droga).<br>"
+            "3. Błąd komunikacji z serwerami rządowymi."
+        )
+
+    # --- PRZETWARZANIE WYNIKU ---
+    
+    # Wyciągamy właściwy obiekt (Feature)
     feature = None
-    for child in fm:
-        # Szukamy elementu, który jest tagiem (obiektem)
+    for child in feature_member:
         if isinstance(child.tag, str):
             feature = child
             break
 
     if feature is None:
-        raise RuntimeError("Znaleziono featureMember, ale jest pusty.")
+        raise RuntimeError("Błąd struktury XML (znaleziono featureMember, ale pusty).")
 
-    # Parsowanie atrybutów do tabelki HTML
+    # Wyciągamy atrybuty tekstowe
     props = {}
     for child in feature:
-        if not isinstance(child.tag, str):
-            continue
-        # Usuwamy namespace z nazwy pola (np. {http://...}nazwa -> nazwa)
+        if not isinstance(child.tag, str): continue
         local_name = child.tag.split("}")[-1]
         
-        # Pomijamy geometrię (nie chcemy wyświetlać tysięcy współrzędnych)
-        if local_name.lower() in ("geom", "geometry", "the_geom", "msgeometry", "shape"):
+        # Ignorujemy geometrię
+        if local_name.lower() in ("geom", "geometry", "the_geom", "msgeometry", "shape", "boundedby"):
             continue
             
         text = (child.text or "").strip()
@@ -180,32 +185,30 @@ def pobierz_mpzp_z_wfs(punkty):
             props[local_name] = text
 
     if not props:
-        raise RuntimeError("Obiekt nie posiada czytelnych atrybutów tekstowych.")
+        raise RuntimeError("Znaleziono obiekt MPZP, ale nie posiada on czytelnych atrybutów tekstowych.")
 
-    # Budowanie tabelki HTML
+    # Budujemy HTML
     rows = []
     for k, v in props.items():
-        rows.append(f"<tr><td style='font-weight:bold; background-color:#f0f2f6;'>{k}</td><td>{v}</td></tr>")
+        # Ładne formatowanie tabeli
+        rows.append(f"<tr><td style='font-weight:bold; background-color:#f0f2f6; width:30%;'>{k}</td><td>{v}</td></tr>")
 
     html = (
+        f"<div style='margin-bottom:10px; font-size:0.9em; color:green;'>✅ Źródło danych: {zrodlo_sukces}</div>"
         "<div style='overflow-x:auto;'>"
-        "<table border='1' style='border-collapse: collapse; width:100%; border:1px solid #ddd;'>"
-        "<tbody>"
-        + "".join(rows)
-        + "</tbody></table></div>"
+        "<table border='1' style='border-collapse: collapse; width:100%; border:1px solid #ddd; font-family:sans-serif;'>"
+        "<tbody>" + "".join(rows) + "</tbody></table></div>"
     )
 
     return html
 
 
-# --- 3. SESSION STATE (Pamięć podręczna aplikacji) ---
+# --- 3. SESSION STATE ---
 
 if "punkty_mapy" not in st.session_state:
     st.session_state.punkty_mapy = None
-
 if "wyniki_powierzchni" not in st.session_state:
     st.session_state.wyniki_powierzchni = None
-
 if "mpzp_html" not in st.session_state:
     st.session_state.mpzp_html = None
 
@@ -216,32 +219,29 @@ col_input, col_map = st.columns([1, 2])
 
 with col_input:
     st.subheader("1. Dane wejściowe")
+    st.caption("Sprawdź, czy Twoja działka jest objęta wektorowym planem zagospodarowania.")
 
     dane_wejsciowe = st.text_area(
         "Wklej współrzędne:",
         height=300,
-        help="Program sam znajdzie liczby i zignoruje resztę tekstu.",
+        help="Wklej punkty z Geoportalu lub Google Maps.",
     )
 
     zamien_kolejnosc = st.checkbox(
         "🔄 Zamień kolejność (Lat ↔ Lon)",
         value=False,
-        help="Zaznacz, jeśli Twoje dane to Długość, Szerokość (np. z Geoportalu: 21.01, 52.22).",
+        help="Zaznacz, jeśli dane to Długość, Szerokość (np. 18.6, 54.3 z Geoportalu dla Przejazdowa).",
     )
-
-    st.info(
-        "Domyślny format: Szerokość (50...), Długość (20...).\n"
-        "Jeśli po wygenerowaniu mapa pokazuje Afrykę/Ocean -> Zaznacz checkbox powyżej."
-    )
+    
+    st.info("Dla Przejazdowa (Gdańsk) szerokość to ~54.3, a długość ~18.6.")
 
     if st.button("🚀 GENERUJ MAPĘ", use_container_width=True):
         if dane_wejsciowe:
             # 1. Parsowanie
             surowe_punkty = parsuj_wspolrzedne(dane_wejsciowe)
 
-            # 2. Ewentualna zamiana kolejności
+            # 2. Zamiana kolejności jeśli trzeba
             if zamien_kolejnosc:
-                # Zamieniamy [Lon, Lat] -> [Lat, Lon]
                 finalne_punkty = [[p[1], p[0]] for p in surowe_punkty]
             else:
                 finalne_punkty = surowe_punkty
@@ -261,14 +261,16 @@ with col_input:
                 }
 
                 # 5. Pobranie MPZP (z obsługą błędów)
+                st.session_state.mpzp_html = None # Reset poprzedniego wyniku
                 try:
-                    with st.spinner("Pobieranie danych o MPZP z GUGiK..."):
+                    with st.spinner("Pytam Integrator Krajowy (GUGiK)..."):
                         html_res = pobierz_mpzp_z_wfs(finalne_punkty)
                         st.session_state.mpzp_html = html_res
                 except Exception as e:
                     st.session_state.mpzp_html = (
-                        f"<div style='color:red; padding:10px; border:1px solid red; background:#fff5f5;'>"
-                        f"<b>Nie udało się pobrać danych MPZP.</b><br>Przyczyna: {e}</div>"
+                        f"<div style='color:#a94442; background-color:#f2dede; border-color:#ebccd1; padding:15px; border-radius:4px;'>"
+                        f"<b>Brak danych MPZP dla tej lokalizacji.</b><br><br>"
+                        f"<i>Komunikat systemu:</i> {e}</div>"
                     )
         else:
             st.warning("Wklej najpierw dane!")
@@ -290,11 +292,11 @@ with col_map:
         st.markdown("---")
         
         # Sekcja MPZP
-        st.subheader("📋 Informacja z MPZP (Krajowa Integracja)")
+        st.subheader("📋 Parametry z MPZP (Wektorowe)")
         if st.session_state.mpzp_html:
             st.markdown(st.session_state.mpzp_html, unsafe_allow_html=True)
         else:
-            st.info("Brak danych MPZP w pamięci.")
+            st.info("Oczekiwanie na dane...")
 
         st.markdown("---")
 
@@ -302,54 +304,36 @@ with col_map:
         srodek = punkty[0]
         m = folium.Map(location=srodek, zoom_start=17)
 
-        # 1. Ortofotomapa
+        # Warstwy
         folium.raster_layers.WmsTileLayer(
             url="https://mapy.geoportal.gov.pl/wss/service/PZGIK/ORTO/WMS/StandardResolution",
-            layers="Raster",
-            name="Ortofotomapa",
-            fmt="image/png",
-            transparent=True,
-            attr="GUGiK",
+            layers="Raster", name="Ortofotomapa", fmt="image/png", transparent=True, attr="GUGiK"
         ).add_to(m)
 
-        # 2. Działki
         folium.raster_layers.WmsTileLayer(
             url="https://integracja.gugik.gov.pl/cgi-bin/KrajowaIntegracjaEwidencjiGruntow",
-            layers="dzialki",
-            name="Działki Ewid.",
-            fmt="image/png",
-            transparent=True,
-            attr="GUGiK",
+            layers="dzialki", name="Działki Ewid.", fmt="image/png", transparent=True, attr="GUGiK"
         ).add_to(m)
 
-        # 3. MPZP (Warstwa wizualna - Integracja Krajowa)
+        # Warstwa wizualna MPZP (rysunek planu) - zawsze warto widzieć, nawet jak nie ma wektora
         folium.raster_layers.WmsTileLayer(
             url="https://mapy.geoportal.gov.pl/wss/ext/KrajowaIntegracjaMiejscowychPlanowZagospodarowaniaPrzestrzennego",
             layers="granice,raster,wektor-str,wektor-lzb,wektor-lin,wektor-pow,wektor-pkt",
-            name="MPZP (Rysunek)",
-            fmt="image/png",
-            transparent=True,
-            attr="GUGiK MPZP",
+            name="Rysunek MPZP", fmt="image/png", transparent=True, attr="GUGiK MPZP"
         ).add_to(m)
 
-        # Poligon
+        # Poligon działki
         folium.Polygon(
-            locations=punkty,
-            color="#FF0000",
-            weight=3,
-            fill=True,
-            fill_color="#FF0000",
-            fill_opacity=0.2,
-            popup=f"Powierzchnia: {wyniki['m2']:,.0f} m²",
+            locations=punkty, color="#FF0000", weight=3, fill=True, fill_color="#FF0000", fill_opacity=0.2,
+            popup=f"Powierzchnia: {wyniki['m2']:,.0f} m²"
         ).add_to(m)
 
         folium.LayerControl().add_to(m)
         st_folium(m, width=800, height=600)
 
-        # Reset
         if st.button("Wyczyść wszystko"):
-            for key in ["punkty_mapy", "wyniki_powierzchni", "mpzp_html"]:
-                st.session_state[key] = None
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
             st.rerun()
     else:
-        st.info("👈 Wklej współrzędne w panelu po lewej i kliknij GENERUJ.")
+        st.info("👈 Wklej współrzędne działki z Przejazdowa (lub innej) po lewej stronie.")
