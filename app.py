@@ -23,9 +23,13 @@ st.markdown(
 # Adres usługi MPZP dla gminy Wieliczka (Geo-System / IGEOMAP)
 MPZP_WFS_URL = "https://mpzp.igeomap.pl/cgi-bin/121905"
 
-# Transformer WGS84 -> PUWG 1992 (EPSG:4326 -> EPSG:2180), potrzebny do BBOX w metrach
-# always_xy=True: wejście jako (lon, lat)
-transformer_4326_2180 = Transformer.from_crs("EPSG:4326", "EPSG:2180", always_xy=True)
+# Typy obiektów – na podstawie dokumentacji innych gmin w mpzp.igeomap.pl
+# (rysunki + dokumenty MPZP)
+MPZP_WFS_TYPENAMES = "app.RysunkiAktuPlanowania.MPZP,app.DokumentFormalny.MPZP"
+
+# Transformer WGS84 -> Web Mercator (EPSG:4326 -> EPSG:3857)
+# Wiele usług MPZP WFS działa właśnie w 3857
+transformer_4326_3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
 
 
 # --- 1. FUNKCJE POMOCNICZE ---
@@ -85,17 +89,19 @@ def oblicz_powierzchnie_m2(punkty):
     return abs(area) / 2.0
 
 
-# --- 2. MPZP: PRÓBA WFS (mpzp.igeomap.pl) z parsowaniem GML ---
+# --- 2. MPZP: WFS (mpzp.igeomap.pl) z GML w EPSG:3857 ---
 
 def pobierz_mpzp_z_wfs(punkty):
     """
     Próbuje pobrać dane MPZP z usługi WFS (mpzp.igeomap.pl) dla gminy Wieliczka.
 
     1. Wyznacza środek wielokąta w EPSG:4326.
-    2. Przelicza go do EPSG:2180 (metry).
-    3. Robi mały BBOX wokół punktu.
-    4. Odczytuje WFS GetCapabilities, żeby znaleźć typeName.
-    5. Robi GetFeature z BBOX (GML) i buduje prosty HTML z atrybutami pierwszego obiektu.
+    2. Przelicza go do EPSG:3857 (metry w pseudo-Mercator).
+    3. Robi BBOX wokół punktu.
+    4. Robi GetFeature dla typów:
+       - app.RysunkiAktuPlanowania.MPZP
+       - app.DokumentFormalny.MPZP
+    5. Parsuje GML i buduje HTML z atrybutami pierwszego obiektu.
 
     Jeśli nic nie znajdzie albo coś pójdzie nie tak – rzuca RuntimeError.
     """
@@ -108,56 +114,26 @@ def pobierz_mpzp_z_wfs(punkty):
     center_lat = sum(lats) / len(lats)
     center_lon = sum(lons) / len(lons)
 
-    # 2. transformacja do EPSG:2180 (x, y w metrach)
-    x_2180, y_2180 = transformer_4326_2180.transform(center_lon, center_lat)
+    # 2. transformacja do EPSG:3857 (x, y w metrach)
+    x_3857, y_3857 = transformer_4326_3857.transform(center_lon, center_lat)
 
-    # 3. małe okno w metrach (np. 10 m w każdą stronę)
-    delta_m = 10.0
-    minx = x_2180 - delta_m
-    maxx = x_2180 + delta_m
-    miny = y_2180 - delta_m
-    maxy = y_2180 + delta_m
+    # 3. okno w metrach (np. 50 m w każdą stronę – trochę większe niż wcześniej)
+    delta_m = 50.0
+    minx = x_3857 - delta_m
+    maxx = x_3857 + delta_m
+    miny = y_3857 - delta_m
+    maxy = y_3857 + delta_m
 
-    # 4. WFS GetCapabilities – bierzemy pierwszy FeatureType jako domyślny
-    cap_params = {
-        "SERVICE": "WFS",
-        "REQUEST": "GetCapabilities",
-        "VERSION": "1.1.0",
-    }
-
-    try:
-        cap_resp = requests.get(MPZP_WFS_URL, params=cap_params, timeout=15)
-        cap_resp.raise_for_status()
-    except Exception as e:
-        raise RuntimeError(f"Błąd GetCapabilities WFS MPZP: {e}")
-
-    try:
-        root_cap = ET.fromstring(cap_resp.content)
-    except ET.ParseError as e:
-        raise RuntimeError(f"Nie można sparsować GetCapabilities WFS MPZP: {e}")
-
-    ns_cap = {
-        "wfs": "http://www.opengis.net/wfs",
-        "ows": "http://www.opengis.net/ows",
-        "xsd": "http://www.w3.org/2001/XMLSchema",
-    }
-
-    type_names = [el.text for el in root_cap.findall(".//wfs:FeatureType/wfs:Name", ns_cap)]
-    if not type_names:
-        raise RuntimeError("Brak FeatureType w WFS MPZP (GetCapabilities).")
-
-    # Na start bierzemy pierwszy typ z listy (jeśli trzeba, można to później uszczegółowić)
-    type_name = type_names[0]
-
-    # 5. GetFeature z BBOX w EPSG:2180 – domyślnie GML (OUTPUTFORMAT nie wymuszamy)
+    # 4. GetFeature dla z góry znanych typów APP.*
     getfeat_params = {
         "SERVICE": "WFS",
         "VERSION": "1.1.0",
         "REQUEST": "GetFeature",
-        "TYPENAME": type_name,
-        "SRSNAME": "EPSG:2180",
-        "BBOX": f"{minx},{miny},{maxx},{maxy},EPSG:2180",
+        "TYPENAME": MPZP_WFS_TYPENAMES,
+        "SRSNAME": "EPSG:3857",
+        "BBOX": f"{minx},{miny},{maxx},{maxy},EPSG:3857",
         "MAXFEATURES": "10",
+        "OUTPUTFORMAT": "GML2",  # zgodnie z przykładami z innych gmin
     }
 
     try:
@@ -306,7 +282,7 @@ with col_map:
         m1, m2c, m3 = st.columns(3)
         m1.metric("Metry kwadratowe", f"{wyniki['m2']:,.0f} m²")
         m2c.metric("Ary", f"{wyniki['ar']:.2f} ar")
-        m3.metric("Hektary", f"{wyniki['ha']:.4f} ha")
+        m3.metric("Hektary", f"{wyniki['ha']:,.4f} ha")
 
         # MPZP – informacja tekstowa
         st.subheader("Informacja o MPZP (WFS – mpzp.igeomap.pl / Wieliczka)")
@@ -342,7 +318,7 @@ with col_map:
             attr="GUGiK",
         ).add_to(m)
 
-        # MPZP – nadal możesz zostawić krajowy KIMPZP jako podgląd graficzny
+        # MPZP – krajowy KIMPZP jako podgląd graficzny
         folium.raster_layers.WmsTileLayer(
             url=(
                 "https://mapy.geoportal.gov.pl/wss/ext/"
