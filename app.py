@@ -3,6 +3,7 @@ import re
 
 import requests
 from requests.exceptions import ReadTimeout, RequestException
+from pyproj import Transformer
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
@@ -84,7 +85,12 @@ def oblicz_powierzchnie_m2(punkty):
     return abs(area) / 2.0
 
 
-# --- 2. MPZP: FUNKCJA POBIERANIA INFORMACJI Z KIMPZP ---
+# --- 2. MPZP: FUNKCJA POBIERANIA INFORMACJI Z KIMPZP (EPSG:2180) ---
+
+# Transformer WGS84 -> PUWG 1992 (EPSG:4326 -> EPSG:2180)
+# always_xy=True: wejście jako (lon, lat)
+transformer_4326_2180 = Transformer.from_crs("EPSG:4326", "EPSG:2180", always_xy=True)
+
 
 def pobierz_mpzp_html(punkty):
     """
@@ -92,24 +98,27 @@ def pobierz_mpzp_html(punkty):
     Zwraca HTML z odpowiedzi GetFeatureInfo z usługi
     Krajowa Integracja Miejscowych Planów Zagospodarowania Przestrzennego (KIMPZP).
 
+    Używamy SRS=EPSG:2180, tak jak w oficjalnym przykładzie usługi.
     Jeśli usługa nie odpowie / zwróci błąd, zwracamy tekstowy komunikat w HTML.
     """
     if not punkty:
         return "<p>Brak punktów do zapytania MPZP.</p>"
 
-    # środek wielokąta
+    # środek wielokąta w WGS84
     lats = [p[0] for p in punkty]
     lons = [p[1] for p in punkty]
     center_lat = sum(lats) / len(lats)
     center_lon = sum(lons) / len(lons)
 
-    # małe okno w stopniach (ok. 10 m w każdą stronę)
-    # 1 stopień ~ 111 km, więc 10 m ~ 0.00009°
-    delta_deg = 0.0001
-    min_lon = center_lon - delta_deg
-    max_lon = center_lon + delta_deg
-    min_lat = center_lat - delta_deg
-    max_lat = center_lat + delta_deg
+    # transformacja do EPSG:2180 (x, y w metrach)
+    x_2180, y_2180 = transformer_4326_2180.transform(center_lon, center_lat)
+
+    # małe okno w metrach (np. 10 m w każdą stronę)
+    delta_m = 10.0
+    minx = x_2180 - delta_m
+    maxx = x_2180 + delta_m
+    miny = y_2180 - delta_m
+    maxy = y_2180 + delta_m
 
     url = (
         "https://mapy.geoportal.gov.pl/wss/ext/"
@@ -120,11 +129,11 @@ def pobierz_mpzp_html(punkty):
         "SERVICE": "WMS",
         "REQUEST": "GetFeatureInfo",
         "VERSION": "1.1.1",
-        "SRS": "EPSG:4326",
+        "SRS": "EPSG:2180",
         # warstwy standardowo używane w KIMPZP
         "LAYERS": "granice,raster,wektor-str,wektor-lzb,wektor-lin,wektor-pow,wektor-pkt",
         "QUERY_LAYERS": "granice,raster,wektor-str,wektor-lzb,wektor-lin,wektor-pow,wektor-pkt",
-        "BBOX": f"{min_lon},{min_lat},{max_lon},{max_lat}",  # lon/lat,lon/lat
+        "BBOX": f"{minx},{miny},{maxx},{maxy}",
         "WIDTH": 101,
         "HEIGHT": 101,
         "X": 50,  # środek "rastra"
